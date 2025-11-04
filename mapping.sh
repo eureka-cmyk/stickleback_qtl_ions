@@ -9,11 +9,11 @@
 #SBATCH --ntasks=1
 #SBATCH --tasks-per-node=1
 #SBATCH --cpus-per-task=6
-#SBATCH --array=1-148
+#SBATCH --array=1-384
 #SBATCH --mem=30g
 #SBATCH --time=48:00:00
 #SBATCH --job-name=bwa_mapping
-#SBATCH --output=/gpfs01/home/mbzcp2/slurm_outputs/slurm-%x-%j.out
+#SBATCH --output=/gpfs01/home/shxyt1/slurm_outputs/slurm-%x-%j.out
 
 # load the necessary modules
 module load bwa-uoneasy/0.7.17-GCCcore-12.3.0
@@ -25,9 +25,9 @@ module load samtools-uoneasy/1.18-GCC-12.3.0
 input_directory=(~/data/sticklebacks/seq)
 
 # Draft genome to use
-genome_name=(GCA_046562415.1_Duke_GAcu_1.0_genomic)
+genome_name=(stickleback_v5.0.1_assembly)
 # genome_name=(GCF_016920845.1_GAculeatus_UGA_version5_genomic)
-genome=(/gpfs01/home/mbzcp2/data/sticklebacks/genomes/$genome_name.fna)
+genome=(/gpfs01/home/shxyt1/data/sticklebacks/ref/fresh/$genome_name.fa)
 
 dir_output=(~/data/sticklebacks/bams/$genome_name/raw_bams)
 # Make output directory
