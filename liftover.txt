@@ -1,0 +1,298 @@
+#===================== 0) Enter conda and prepare liftover environment =====================
+module load Anaconda3/2023.09-0
+
+# If conda activate was not available before, run once:
+# conda init bash && source ~/.bashrc
+
+# Create a clean env for liftOver (do once)
+conda create -n liftover_env -c bioconda -c conda-forge ucsc-liftover -y
+
+# Activate env (every time)
+conda activate liftover_env
+
+#===================== 1) Set paths =====================
+WORKDIR=/gpfs01/home/shxyt1/data/sticklebacks/gwas/gwas_5pc_log_nine_main
+CSV=${WORKDIR}/All_log_nine_main_TopSNPs_with_genes.csv
+CHAIN=/gpfs01/home/shxyt1/app/chain/v5_to_v1.chain.txt
+
+cd ${WORKDIR}
+
+#===================== 2) Build BED from CSV (v5 coords) using Roman chr names =====================
+# This maps numeric CHR (1-21) -> chrI..chrXXI to match chain naming (tName)
+awk -F',' '
+BEGIN{
+  rom[1]="chrI"; rom[2]="chrII"; rom[3]="chrIII"; rom[4]="chrIV"; rom[5]="chrV"; rom[6]="chrVI"; rom[7]="chrVII";
+  rom[8]="chrVIII"; rom[9]="chrIX"; rom[10]="chrX"; rom[11]="chrXI"; rom[12]="chrXII"; rom[13]="chrXIII"; rom[14]="chrXIV";
+  rom[15]="chrXV"; rom[16]="chrXVI"; rom[17]="chrXVII"; rom[18]="chrXVIII"; rom[19]="chrXIX"; rom[20]="chrXX"; rom[21]="chrXXI";
+}
+NR==1{next}
+# Keep only rows with numeric CHR and positive numeric BP
+$3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $4 > 0 && ($3 in rom) {
+  # BED is 0-based: start=BP-1, end=BP
+  # Column4 keeps a stable key for merging back: Element|gene_symbol|SNP(v5)
+  print rom[$3] "\t" ($4-1) "\t" $4 "\t" $1 "|" $7 "|" $2
+}' ${CSV} > All_log_nine_main_TopSNPs_with_genes.bed
+
+# Sanity checks
+awk -F'\t' 'NF<3 || $1=="" || $2<0 || $3=="" {print "Bad line:", NR ":" $0; exit}' All_log_nine_main_TopSNPs_with_genes.bed
+cut -f1 All_log_nine_main_TopSNPs_with_genes.bed | sort | uniq -c | head -50
+
+#===================== 3) Run liftOver (choose strictness) =====================
+# Option A: high-confidence mapping (recommended for downstream)
+liftOver \
+  All_log_nine_main_TopSNPs_with_genes.bed \
+  ${CHAIN} \
+  All_log_nine_main_TopSNPs_with_genes.v1.bed \
+  All_log_nine_main_TopSNPs_with_genes.unlifted.bed \
+  -minMatch=0.95
+
+# Option B: maximize mapping (may be noisier)
+# liftOver \
+#   All_log_nine_main_TopSNPs_with_genes.bed \
+#   ${CHAIN} \
+#   All_log_nine_main_TopSNPs_with_genes.v1.bed \
+#   All_log_nine_main_TopSNPs_with_genes.unlifted.bed \
+#   -multiple -minMatch=0
+
+# Check outputs
+wc -l All_log_nine_main_TopSNPs_with_genes.bed All_log_nine_main_TopSNPs_with_genes.v1.bed All_log_nine_main_TopSNPs_with_genes.unlifted.bed
+cut -f1 All_log_nine_main_TopSNPs_with_genes.v1.bed | sort | uniq -c | head -50
+head -n 20 All_log_nine_main_TopSNPs_with_genes.unlifted.bed
+
+#===================== 4) Backfill v1 coordinates into CSV =====================
+Rscript - <<'RS'
+# Input / output
+csv_in  <- "All_log_nine_main_TopSNPs_with_genes.csv"
+bed_v1  <- "All_log_nine_main_TopSNPs_with_genes.v1.bed"
+csv_out <- "All_log_nine_main_TopSNPs_with_genes.liftover_v1.csv"
+
+# Read original CSV
+df <- read.csv(csv_in, stringsAsFactors=FALSE, check.names=FALSE)
+
+# Build stable join key matching BED col4: Element|gene_symbol|SNP(v5)
+df$key <- paste(df$Element, df$gene_symbol, df$SNP, sep="|")
+
+# Read v1 bed: chrom start end key [score]
+v1 <- read.table(bed_v1, sep="\t", stringsAsFactors=FALSE, header=FALSE, quote="")
+colnames(v1)[1:4] <- c("CHR_v1","start_v1","end_v1","key")
+v1$BP_v1  <- as.integer(v1$end_v1)
+v1$SNP_v1 <- paste0(v1$CHR_v1, ":", v1$BP_v1)
+
+# Keep the first mapping per key (in case of duplicates)
+v1 <- v1[!duplicated(v1$key), c("key","CHR_v1","BP_v1","SNP_v1")]
+
+# Left join back
+out <- merge(df, v1, by="key", all.x=TRUE, sort=FALSE)
+out$key <- NULL
+
+# Write final CSV
+write.csv(out, csv_out, row.names=FALSE, quote=TRUE)
+
+# Summary
+mapped <- sum(!is.na(out$BP_v1))
+cat("Mapped rows:", mapped, "out of", nrow(out), "\n")
+RS
+
+# Quick preview
+head -n 5 All_log_nine_main_TopSNPs_with_genes.liftover_v1.csv
+
+#===================== 5) (Optional) List unmapped rows in the final CSV =====================
+Rscript - <<'RS'
+df <- read.csv("All_log_nine_main_TopSNPs_with_genes.liftover_v1.csv", check.names=FALSE)
+miss <- df[is.na(df$BP_v1), ]
+cat("Unmapped rows:", nrow(miss), "\n")
+if(nrow(miss)>0) print(miss[, c("Element","SNP","CHR","BP","gene_symbol")])
+RS
+
+
+
+#=======================
+# QTL v1 -> v5 liftOver pipeline (write EVERYTHING to OUTDIR only)
+#=======================
+
+#===================== 0) Load conda & activate env =====================
+module load Anaconda3/2023.09-0
+conda activate liftover_env
+
+#===================== 1) Set paths (ONLY OUTDIR will contain outputs) =====================
+INDIR=/gpfs01/home/shxyt1/data/sticklebacks/qtl_catlog
+INXLSX=${INDIR}/qtl_catlog.xlsx
+
+CHAIN=/gpfs01/home/shxyt1/app/chain/v1_to_v5.chain.txt
+
+OUTDIR=/gpfs01/home/shxyt1/data/sticklebacks/qtl_catlog
+mkdir -p ${OUTDIR}
+cd ${OUTDIR}
+
+# Binaries (use conda env absolute path to avoid GLIBC-mismatch binaries elsewhere)
+PYTHON=/gpfs01/home/shxyt1/.conda/envs/liftover_env/bin/python
+LIFTOVER=/gpfs01/home/shxyt1/.conda/envs/liftover_env/bin/liftOver
+
+# Output files (all under OUTDIR)
+BED_IN=${OUTDIR}/qtl_catlog.v1_to_v5.bed
+BED_OUT=${OUTDIR}/qtl_catlog.v1_to_v5.lifted.bed
+BED_UNLIFT=${OUTDIR}/qtl_catlog.v1_to_v5.unlifted.bed
+
+OUTXLSX=${OUTDIR}/qtl_catlog.v1_to_v5.lifted.xlsx
+OUTTSV=${OUTDIR}/qtl_catlog.v1_to_v5.lifted.tsv
+
+#===================== 2) Build BED from XLSX (v1 coords; header is 2nd row) =====================
+${PYTHON} - <<PY
+import pandas as pd
+
+in_xlsx = "${INXLSX}"
+bed_out = "${BED_IN}"
+
+# Read sheet with the 2nd row as the real header
+df = pd.read_excel(in_xlsx, sheet_name=0, header=1, dtype=object)
+
+def to_int(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    if s == "" or s.lower() == "nan":
+        return None
+    try:
+        return int(float(s))
+    except:
+        return None
+
+def to_chr(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    if s == "" or s.lower() == "nan":
+        return None
+    return s
+
+# Exact column names (your sheet)
+blocks = [
+    ("BS1_marker", "BS1_chr_start", "BS1_pos_start", "BS1_chr_end", "BS1_pos_end"),
+    ("BS1_region", "BS1_chr_regstart", "BS1_pos_regstart", "BS1_chr_regend", "BS1_pos_regend"),
+    ("ROE_marker", "ROE_chr_start", "ROE_pos_start", "ROE_chr_end", "ROE_pos_end"),
+    ("ROE_region", "ROE_chr_regstart", "ROE_pos_regstart", "ROE_chr_regend", "ROE_pos_regend"),
+    ("GLA_marker", "GLA_chr_start", "GLA_pos_start", "GLA_chr_end", "GLA_pos_end"),
+    ("GLA_region", "GLA_chr_regstart", "pos_regstart_GLA", "GLA_chr_regend", "GLA_pos_regend"),
+]
+
+rows = []
+for i in range(len(df)):
+    row_id = i + 1  # 1-based row index
+    for prefix, c1, p1, c2, p2 in blocks:
+        chr_s = to_chr(df.at[i, c1]); pos_s = to_int(df.at[i, p1])
+        chr_e = to_chr(df.at[i, c2]); pos_e = to_int(df.at[i, p2])
+
+        # Start point
+        if chr_s is not None and pos_s is not None and pos_s > 0:
+            rows.append((chr_s, pos_s - 1, pos_s, f"{row_id}|{prefix}_start"))
+
+        # End point
+        if chr_e is not None and pos_e is not None and pos_e > 0:
+            rows.append((chr_e, pos_e - 1, pos_e, f"{row_id}|{prefix}_end"))
+
+bed = pd.DataFrame(rows, columns=["chrom","start","end","name"])
+bed.to_csv(bed_out, sep="\t", header=False, index=False)
+
+print("Wrote BED:", bed_out)
+print("Total BED records:", len(bed))
+print("Preview:")
+print(bed.head(10).to_string(index=False))
+PY
+
+# Quick sanity checks
+awk -F'\t' 'NF<4 || $1=="" || $2<0 || $3=="" || $4=="" {print "Bad line:", NR ":" $0; exit 1}' ${BED_IN}
+wc -l ${BED_IN}
+cut -f1 ${BED_IN} | sort | uniq -c | head -50
+
+#===================== 3) Run liftOver (v1 -> v5) =====================
+# NOTE: outputs are written ONLY to OUTDIR
+CHAIN=/gpfs01/home/shxyt1/app/chain/v1_withChrUn_to_v5.chain.txt
+LIFTOVER=/gpfs01/home/shxyt1/.conda/envs/liftover_env/bin/liftOver
+
+BED_IN=qtl_catlog.v1_to_v5.bed
+BED_OUT=qtl_catlog.v1_to_v5.lifted.bed
+BED_UNLIFT=qtl_catlog.v1_to_v5.unlifted.bed
+
+${LIFTOVER} \
+  ${BED_IN} \
+  ${CHAIN} \
+  ${BED_OUT} \
+  ${BED_UNLIFT} \
+  -minMatch=0.95
+
+#===================== 4) Backfill lifted coords into XLSX + TSV =====================
+/gpfs01/home/shxyt1/.conda/envs/liftover_env/bin/python - <<'PY'
+import pandas as pd
+
+in_xlsx = "/gpfs01/home/shxyt1/data/sticklebacks/qtl_catlog/qtl_catlog.xlsx"
+bed_lifted = "qtl_catlog.v1_to_v5.lifted.bed"
+
+out_xlsx = "qtl_catlog.v1_to_v5.lifted.xlsx"
+out_tsv  = "qtl_catlog.v1_to_v5.lifted.tsv"
+
+# Use header=1 to read the real column names (2nd row)
+df = pd.read_excel(in_xlsx, sheet_name=0, header=1, dtype=object)
+
+# Prepare new columns
+prefixes = ["BS1_marker","BS1_region","ROE_marker","ROE_region","GLA_marker","GLA_region"]
+for pre in prefixes:
+    for side in ["start","end"]:
+        df[f"{pre}_chr_{side}_v5"] = pd.NA
+        df[f"{pre}_pos_{side}_v5"] = pd.NA
+
+# Read lifted BED
+lift = pd.read_csv(bed_lifted, sep="\t", header=None, dtype={0:str,1:int,2:int,3:str})
+lift.columns = ["chr_v5","start0_v5","end0_v5","name"]
+
+mapped = 0
+for _, r in lift.iterrows():
+    key = str(r["name"])
+    if "|" not in key:
+        continue
+    row_str, field = key.split("|", 1)
+    try:
+        row_id = int(row_str)  # 1-based
+    except:
+        continue
+    i = row_id - 1
+    if i < 0 or i >= len(df):
+        continue
+
+    if field.endswith("_start"):
+        pre = field[:-6]
+        side = "start"
+    elif field.endswith("_end"):
+        pre = field[:-4]
+        side = "end"
+    else:
+        continue
+
+    chr_v5 = r["chr_v5"]
+    pos_v5 = int(r["end0_v5"])  # point BED -> 1-based position
+
+    chr_col = f"{pre}_chr_{side}_v5"
+    pos_col = f"{pre}_pos_{side}_v5"
+
+    if chr_col in df.columns and pos_col in df.columns:
+        df.at[i, chr_col] = chr_v5
+        df.at[i, pos_col] = pos_v5
+        mapped += 1
+
+# Save outputs (only in this directory)
+df.to_csv(out_tsv, sep="\t", index=False)
+with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
+    df.to_excel(w, index=False, sheet_name="Sheet1")
+
+print("Mapped BED records:", mapped)
+print("Saved:", out_tsv)
+print("Saved:", out_xlsx)
+PY
+
+python - <<'PY'
+import pandas as pd
+df = pd.read_excel("qtl_catlog.v1_to_v5.lifted.xlsx", dtype=object)
+cols = [c for c in df.columns if c.endswith("_pos_start_v5") or c.endswith("_pos_end_v5")]
+print("v5 columns:", cols[:10])
+print(df.loc[:4, ["roi","qtl_trait","BS1_chr_start","BS1_pos_start","BS1_marker_chr_start_v5","BS1_marker_pos_start_v5"]].to_string(index=False))
+PY
+
